@@ -4,7 +4,7 @@
 
 The Token Ring System simulates a distributed environment where multiple processes coordinate access to a critical section using a token. It uses a Lamport clock for timestamping and handles message communication using polymorphism rather than a switch-case statement. The system also demonstrates features such as mutual exclusion, coordinator election and failure detection, fairness in request handling, and process recovery.
 
-**Note:** This implementation is based on the algorithm described in the paper *"Token Ring Algorithm To Achieve Mutual Exclusion In Distributed System – A Centralized Approach"* by Sandipan Basu, published in the *IJCSI International Journal of Computer Science Issues, Vol. 8, Issue 1, January 2011* citeturn0file0.
+**Note:** This implementation is based on the algorithm described in the paper *"Token Ring Algorithm To Achieve Mutual Exclusion In Distributed System – A Centralized Approach"* by Sandipan Basu, published in the *IJCSI International Journal of Computer Science Issues, Vol. 8, Issue 1, January 2011*
 
 ## Components
 
