@@ -1,146 +1,165 @@
-# Token Ring System Documentation
+# Distributed Token Ring System Documentation
+
+This documentation describes a Java-based distributed token ring simulation that implements mutual exclusion, token passing, process failure handling, and ring-based election mechanisms. The system uses Lamport clocks for event ordering and employs several message types to coordinate distributed actions.
+
+---
 
 ## Overview
 
-The Token Ring System simulates a distributed environment where multiple processes coordinate access to a critical section using a token. It uses a Lamport clock for timestamping and handles message communication using polymorphism rather than a switch-case statement. The system also demonstrates features such as mutual exclusion, coordinator election and failure detection, fairness in request handling, and process recovery.
+The system simulates a distributed environment where:
+- **Token Passing:** A unique token circulates among processes in a ring. Only the process holding the token can enter its critical section.
+- **Mutual Exclusion:** The token enforces exclusive access to a critical section.
+- **Failure Detection & Election:** If a process suspects the token is lost (due to process failure or delay), it initiates an election using a ring-based algorithm. The election selects a candidate (usually the process with the highest PID) to regenerate the token.
+- **Dynamic Ring Configuration:** Processes update their view of the ring when changes occur (for example, when a process is killed or revived).
+
+---
 
 **Note:** This implementation is based on the algorithm described in the paper *"Token Ring Algorithm To Achieve Mutual Exclusion In Distributed System – A Centralized Approach"* by Sandipan Basu, published in the *IJCSI International Journal of Computer Science Issues, Vol. 8, Issue 1, January 2011*
 
+---
+
 ## Components
 
-### 1. Message and Message Types
+### 1. Message Types and Message Class
 
-- **`enum MessageType`**  
-  Defines the types of messages exchanged between processes:
-  - **`REQUEST`**: A process requests access to the critical section.
-  - **`GRANT`**: The coordinator grants the token to a requesting process.
-  - **`RELEASE`**: A process releases the token after exiting the critical section.
-  - **`WAIT`**: (Reserved for potential waiting functionality.)
-  - **`EXISTS`**: Used by processes to check if the coordinator is alive.
-  - **`OK`**: Acknowledgement message.
-  - **`COORDINATOR`**: Announces the new coordinator.
-  - **`UPDATE`**: (Reserved for updating ring configuration.)
-  - **`NEW`**: Used to add a new process to the ring configuration.
+#### **MessageType (Enum)**
+Defines the types of messages exchanged between processes:
+- **`TOKEN`:** Represents the token used for granting access to the critical section.
+- **`REQUEST`:** (Optional) Used to request access to the critical section.
+- **`ELECTION`:** Triggers a ring-based election to resolve token loss.
+- **`NEW`:** Communicates a new or updated ring configuration.
 
-- **`class Message`**  
-  Represents a communication message between processes. Key fields include:
-  - **`senderPid`**: The process identifier (PID) of the sender.
-  - **`type`**: The type of the message (from `MessageType`).
-  - **`timestamp`**: The Lamport clock timestamp when the message was created.
-  - **`coordinatorPid`**: For `COORDINATOR` messages, the PID of the elected coordinator.
-  - **`ringConfig`**: For `UPDATE` messages, holds the ring configuration (list of process IDs).
+#### **Message (Class)**
+Represents a message sent between processes.
+- **Attributes:**
+  - `int senderPid`: The process ID of the sender.
+  - `MessageType type`: The type of the message.
+  - `int timestamp`: A Lamport timestamp to order events.
+  - `int candidatePid`: (For `ELECTION` messages) The candidate process ID.
+  - `List<Integer> ringConfig`: (For `NEW` messages) The updated ring configuration.
+- **Constructor:**
+  - `Message(int senderPid, MessageType type, int timestamp)`: Initializes a message with basic information.
 
-### 2. Lamport Clock
+---
 
-- **`class LamportClock`**  
-  Implements a logical clock using Lamport’s algorithm:
-  - **`incrementAndGet()`**: Increments the clock and returns the new time.
-  - **`get()`**: Returns the current time.
-  - **`update(int receivedTime)`**: Updates the clock based on the received timestamp, ensuring the clock always advances.
+### 2. LamportClock (Class)
 
-### 3. Message Handlers
+Implements a Lamport logical clock using an `AtomicInteger` for thread-safety.
+- **Methods:**
+  - `int incrementAndGet()`: Increments the clock and returns the new value.
+  - `int get()`: Returns the current clock value.
+  - `void update(int receivedTime)`: Updates the clock to be one more than the maximum of the current time and the received time.
+  - `void reset()`: Resets the clock to zero.
+  - `void set(int value)`: Sets the clock to a specific value.
 
-To avoid a central switch-case statement, the system uses polymorphism by defining a common interface and multiple concrete handler classes for different message types.
+---
 
-- **`interface MessageHandler`**  
-  Declares a single method:
-  - **`void handle(Process process, Message msg)`**: Processes the given message using the context of the process.
+### 3. Message Handling
 
-- **Handler Implementations:**
-  - **`RequestHandler`**:  
-    - Handles `REQUEST` messages by invoking `process.handleRequest(msg)`.
-    
-  - **`GrantHandler`**:  
-    - Handles `GRANT` messages by setting the token flag (`hasToken`) and initiating the critical section via `process.startCriticalSection()`.
-    
-  - **`ExistsHandler`**:  
-    - Handles `EXISTS` messages by calling `process.handleExists(msg)`.
-    
-  - **`ReleaseHandler`**:  
-    - Handles `RELEASE` messages by calling `process.handleRelease(msg)`.
-    
-  - **`NewHandler`**:  
-    - Handles `NEW` messages by adding a new process to the ring configuration if the process is the coordinator.
-    
-  - **`NoOpHandler`**:  
-    - A no-operation handler (used for `OK` messages).
-    
-  - **`CoordinatorHandler`**:  
-    - Handles `COORDINATOR` messages by updating the process’s coordinator information.
+#### **MessageHandler (Interface)**
+Defines the method for processing messages:
+- **Method:**
+  - `void handle(Process process, Message msg)`: Processes a message for the given process.
 
-### 4. Process Class
+#### **Implementations:**
+- **TokenHandler:** Handles `TOKEN` messages by delegating to `Process.handleToken()`.
+- **RequestHandler:** Handles `REQUEST` messages (note: in this design, processes set their own request flag).
+- **ElectionHandler:** Handles `ELECTION` messages by delegating to `Process.handleElection()`.
+- **NewHandler:** Handles `NEW` messages for updating the ring configuration by delegating to `Process.updateRingConfig()`.
 
-- **`class Process implements Runnable`**  
-  Represents a node in the distributed system. Key responsibilities include:
-  - **State Variables:**
-    - `pid`: Unique identifier for the process.
-    - `coordinatorPid`: PID of the current coordinator.
-    - `clock`: Instance of `LamportClock` for managing timestamps.
-    - `requestQueue`: A priority queue that orders `REQUEST` messages by timestamp and sender PID.
-    - `ringConfig`: A list of process IDs representing the token ring.
-    - `inbox`: A blocking queue to store incoming messages.
-    - `scheduler`: Schedules tasks such as sending periodic EXISTS messages or checking coordinator status.
-    - Flags like `hasToken`, `isCoordinator`, and `inCriticalSection` manage process state.
-  - **Message Handling:**  
-    A map (`messageHandlers`) associates each `MessageType` with its corresponding `MessageHandler`. In the main `run()` loop, each incoming message is delegated to the appropriate handler.
-  - **Key Methods:**
-    - **`send(Message msg)`**: Adds a message to the process's inbox.
-    - **`sendToCoordinator(Message msg)`**: Sends a message directly to the coordinator.
-    - **`broadcast(Message msg)`**: Sends a message to all processes in the system.
-    - **`handleRequest(Message msg)`**: Adds a request to the queue and may trigger token granting.
-    - **`grantToken()`**: Grants the token to the next process in the request queue.
-    - **`handleExists(Message msg)`**: Handles EXISTS messages to confirm the coordinator is alive.
-    - **`handleRelease(Message msg)`**: Processes RELEASE messages by freeing up the token.
-    - **`becomeCoordinator()`**: Transitions the process to a coordinator role if a failure is detected.
-    - **`checkCoordinatorAlive()`**: Periodically checks the health of the current coordinator.
-    - **`startCriticalSection()`**: Simulates the execution of the critical section.
-    - **`requestCriticalSection()`**: Sends a REQUEST message to the coordinator to enter the critical section.
+---
 
-### 5. TokenRingSystem
+### 4. Process (Class)
 
-- **`class TokenRingSystem`**  
-  Manages the overall simulation:
-  - **Static List:**
-    - `List<Process> processes`: Holds all process instances.
-  - **`main(String[] args)`**:  
-    - Creates a predefined number of processes.
-    - Starts each process using an executor service.
-    - Initiates a test sequence that simulates:
-      - **Test 1: Mutual Exclusion** – Random processes request access to the critical section.
-      - **Test 2: Coordinator Failure** – The coordinator is deliberately failed to test recovery.
-      - **Test 3: Fairness** – Specific processes are forced to request the critical section.
-      - **Test 4: Process Recovery** – A previously failed process is revived and reintegrated into the ring.
+Represents a node in the distributed system and implements the `Runnable` interface. Each process has its own logical clock and communicates with other processes via a message-passing mechanism.
 
-## How It Works
+#### **Key Attributes:**
+- `int pid`: Unique identifier for the process.
+- `LamportClock clock`: The process’s Lamport clock.
+- `volatile boolean requestCS`: Flag to indicate if the process has requested entry to the critical section.
+- `volatile boolean hasToken`: Flag indicating if the process currently holds the token.
+- `volatile long lastTokenSeen`: Timestamp when the token was last observed.
+- `static final long TOKEN_TIMEOUT`: Timeout threshold (in milliseconds) to trigger recovery/election.
+- `AtomicBoolean electionInProgress`: Flag to prevent concurrent elections.
+- `List<Integer> ringConfig`: Synchronized list that represents the current ring order.
+- `BlockingQueue<Message> inbox`: Message queue for incoming messages.
+- `ScheduledExecutorService scheduler`: Manages periodic tasks such as token timeout checks.
+- `Map<MessageType, MessageHandler> messageHandlers`: Maps each message type to its corresponding handler.
 
-1. **Initialization:**  
-   The `TokenRingSystem` initializes multiple `Process` objects, assigns one as the coordinator, and sets up the ring configuration.
+#### **Key Methods:**
 
-2. **Message Delegation:**  
-   Each process’s `run()` method continuously polls its inbox for messages. Using a handler map, the system delegates the processing of each message to its corresponding handler, which executes the relevant logic (e.g., handling requests, granting tokens, or processing coordinator updates).
+- **Token Management:**
+  - `void handleToken(Message msg)`: Updates the clock, sets `hasToken` to true, and either enters the critical section or passes the token.
+  - `void passToken()`: Resets the token flag and sends the token message to the next live process in the ring.
 
-3. **Critical Section Access:**  
-   When a process requests access via `requestCriticalSection()`, it sends a `REQUEST` message. The coordinator, maintaining a request queue, eventually sends a `GRANT` message (if it has the token), allowing the process to enter its critical section.
+- **Critical Section Control:**
+  - `void enterCriticalSection()`: Simulates entry into the critical section (with a sleep to represent work) and then exits by passing the token.
+  - `void requestCriticalSection()`: Sets the flag to request the critical section and updates the clock.
 
-4. **Coordinator Failure and Recovery:**  
-   The system periodically checks if the coordinator is still alive. If the coordinator fails, another process can become the new coordinator by calling `becomeCoordinator()`. Additionally, the `NEW` message type supports the addition or recovery of processes into the ring configuration.
+- **Communication:**
+  - `void send(Message msg, int targetPid)`: Sends a message to a specific process. If the target process is not alive, it removes the process from the ring and may trigger an election.
+  - `void broadcast(Message msg)`: Sends a message to all other processes.
+  - `int getNextInRing()`: Determines the next process in the current ring configuration.
+  - `void removeFromRing(int targetPid)`: Removes a process from the ring configuration.
+
+- **Election and Recovery:**
+  - `void handleElection(Message msg)`: Processes an election message by updating the candidate PID and forwarding the message. Ends the election when the message returns to the originator.
+  - `void startElection()`: Initiates an election if no token is seen within the timeout period.
+  - `void updateRingConfig(Message msg)`: Updates the local ring configuration upon receiving a `NEW` message and may trigger token regeneration if the current process is designated as the coordinator.
+
+- **Run Loop:**
+  - `void run()`: Continuously polls the inbox for messages, processes them, and checks if it should enter the critical section when holding the token.
+
+- **Process Liveness:**
+  - `void setAlive(boolean alive)`: Setter to simulate process failure or recovery.
+  - `boolean isAlive()`: Returns the process’s liveness status.
+
+---
+
+### 5. TokenRingSystem (Main Class)
+
+This is the entry point of the application. It sets up the processes, defines the initial ring configuration, and simulates system behavior through a test sequence.
+
+#### **Key Responsibilities:**
+- **Initialization:**
+  - Creates a predefined number of processes.
+  - Establishes the initial ring configuration (e.g., process IDs from 0 to N-1).
+  - Assigns the initial token to process 0.
+- **Execution:**
+  - Uses an `ExecutorService` to run each process concurrently.
+- **Test Sequence:**
+  - **Test 1 – Mutual Exclusion:**  
+    Initiates critical section requests for several processes.
+  - **Test 2 – Process Failure and Recovery:**  
+    Simulates the failure (killing) of a process and subsequently revives it. The ring configuration is updated via a broadcast `NEW` message to include the revived process.
+
+---
 
 ## Usage
 
-- **Running the System:**  
-  Execute the `main()` method in the `TokenRingSystem` class. The system will start all processes and run through a sequence of tests simulating:
-  - Mutual exclusion by randomly requesting the critical section.
-  - Coordinator failure and subsequent recovery.
-  - Fairness in servicing requests.
-  - Process recovery and reintegration.
+1. **Compile the Code:**  
+   Ensure all Java files are in the same package or project structure, then compile with:
+   ```bash
+   javac TokenRingSystem.java
+   ```
+2. **Run the Application:**  
+   Start the system using:
+   ```bash
+   java TokenRingSystem
+   ```
+3. **Observe the Output:**  
+   The console will display logs showing token passing, critical section entries, election events, ring updates, and test sequences.
 
-- **Console Output:**  
-  The system prints detailed status messages to the console. These messages trace:
-  - Requests for critical section entry.
-  - Token grants by the coordinator.
-  - Processes entering and leaving the critical section.
-  - Coordinator failure detection and election.
-  - Process recovery events.
+---
+
+## Summary
+
+This code provides a simulation of a distributed token ring system that ensures:
+- **Mutual Exclusion:** Through controlled token passing.
+- **Robustness:** With a ring-based election algorithm to handle token loss due to process failure.
+- **Dynamic Configuration:** By updating the ring when processes join, fail, or recover.
+
+The design leverages multi-threading, synchronized data structures, and scheduled tasks to simulate a realistic distributed environment. This documentation should assist developers in understanding the design, functionality, and usage of the system.
 
 ## Acknowledgments and References
 
