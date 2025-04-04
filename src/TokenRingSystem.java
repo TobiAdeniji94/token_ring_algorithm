@@ -1,20 +1,25 @@
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-// Message types for communication
+// Message types for communication.
 enum MessageType {
-    REQUEST, GRANT, RELEASE, WAIT, EXISTS, OK, COORDINATOR, UPDATE, NEW
+    TOKEN,      // The token for mutual exclusion.
+    REQUEST,    // (Optional) Request for CS; in this design processes set their own flag.
+    ELECTION,   // Message used to trigger a ring-based election.
+    NEW         // Message to update the ring configuration.
 }
 
-// Message structure
 class Message {
     int senderPid;
     MessageType type;
     int timestamp;
-    int coordinatorPid; // For COORDINATOR messages
-    List<Integer> ringConfig; // For UPDATE messages
-
+    // For ELECTION messages: carries the candidate PID.
+    int candidatePid;
+    // For NEW messages: carries a new ring configuration.
+    List<Integer> ringConfig;
+    
     public Message(int senderPid, MessageType type, int timestamp) {
         this.senderPid = senderPid;
         this.type = type;
@@ -22,29 +27,43 @@ class Message {
     }
 }
 
-// Lamport Clock for timestamping
 class LamportClock {
     private AtomicInteger time = new AtomicInteger(0);
-
+    
     public int incrementAndGet() {
         return time.incrementAndGet();
     }
-
+    
     public int get() {
         return time.get();
     }
-
+    
     public void update(int receivedTime) {
         time.updateAndGet(curr -> Math.max(curr, receivedTime) + 1);
     }
+    
+    // Reset the clock to 0.
+    public void reset() {
+        time.set(0);
+    }
+    
+    // Set the clock to a specific value.
+    public void set(int value) {
+        time.set(value);
+    }
 }
 
-// Common interface for message handlers.
 interface MessageHandler {
     void handle(Process process, Message msg);
 }
 
-// Handler for REQUEST messages.
+class TokenHandler implements MessageHandler {
+    @Override
+    public void handle(Process process, Message msg) {
+        process.handleToken(msg);
+    }
+}
+
 class RequestHandler implements MessageHandler {
     @Override
     public void handle(Process process, Message msg) {
@@ -52,210 +71,222 @@ class RequestHandler implements MessageHandler {
     }
 }
 
-// Handler for GRANT messages.
-class GrantHandler implements MessageHandler {
+class ElectionHandler implements MessageHandler {
     @Override
     public void handle(Process process, Message msg) {
-        process.hasToken = true;
-        process.startCriticalSection();
+        process.handleElection(msg);
     }
 }
 
-// Handler for EXISTS messages.
-class ExistsHandler implements MessageHandler {
-    @Override
-    public void handle(Process process, Message msg) {
-        process.handleExists(msg);
-    }
-}
-
-// Handler for RELEASE messages.
-class ReleaseHandler implements MessageHandler {
-    @Override
-    public void handle(Process process, Message msg) {
-        process.handleRelease(msg);
-    }
-}
-
-// Handler for NEW messages.
 class NewHandler implements MessageHandler {
     @Override
     public void handle(Process process, Message msg) {
-        if (process.isCoordinator && !process.ringConfig.contains(msg.senderPid)) {
-            process.ringConfig.add(msg.senderPid);
-            System.out.println("[COORD] Added PID " + msg.senderPid + " to ring");
-        }
+        process.updateRingConfig(msg);
     }
 }
 
-// No-operation handler for OK messages.
-class NoOpHandler implements MessageHandler {
-    @Override
-    public void handle(Process process, Message msg) {
-        // Do nothing for OK messages.
-    }
-}
-
-// Handler for COORDINATOR messages.
-class CoordinatorHandler implements MessageHandler {
-    @Override
-    public void handle(Process process, Message msg) {
-        process.coordinatorPid = msg.coordinatorPid;
-        process.isCoordinator = (process.pid == msg.coordinatorPid);
-    }
-}
-
-// Process class representing a node in the system.
 class Process implements Runnable {
     final int pid;
-    volatile int coordinatorPid;
-    final LamportClock clock = new LamportClock();
-    final PriorityQueue<Message> requestQueue = new PriorityQueue<>(
-        Comparator.comparingInt((Message m) -> m.timestamp).thenComparingInt(m -> m.senderPid)
-    );
-    final List<Integer> ringConfig = new ArrayList<>();
-    final BlockingQueue<Message> inbox = new LinkedBlockingQueue<>();
-    final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    LamportClock clock = new LamportClock();
+    
+    // Flag indicating a local request for the critical section.
+    volatile boolean requestCS = false;
+    // Flag indicating if this process currently holds the token.
     volatile boolean hasToken = false;
-    volatile boolean isCoordinator = false;
-    volatile boolean inCriticalSection = false;
-
-    // Map to hold polymorphic handlers for each MessageType.
+    
+    // For token timeout recovery.
+    volatile long lastTokenSeen = System.currentTimeMillis();
+    static final long TOKEN_TIMEOUT = 5000; // milliseconds
+    
+    // Use AtomicBoolean for thread-safe election flag.
+    final AtomicBoolean electionInProgress = new AtomicBoolean(false);
+    
+    // The ring configuration (an ordered, synchronized list).
+    final List<Integer> ringConfig = Collections.synchronizedList(new ArrayList<>());
+    final BlockingQueue<Message> inbox = new LinkedBlockingQueue<>();
+    
+    // Scheduled executor with a randomized initial delay for timeout checks.
+    final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    
+    // Message handlers.
     private final Map<MessageType, MessageHandler> messageHandlers = new HashMap<>();
-
-    public Process(int pid, int coordinatorPid, List<Integer> initialRing) {
+    
+    public Process(int pid, List<Integer> initialRing) {
         this.pid = pid;
-        this.coordinatorPid = coordinatorPid;
-        this.ringConfig.addAll(initialRing);
-        if (pid == coordinatorPid) {
-            this.hasToken = true;
-            this.isCoordinator = true;
+        // Seed the clock with a random positive initial value.
+        clock.set(new Random().nextInt(100) + 1);
+        
+        synchronized (ringConfig) {
+            ringConfig.addAll(initialRing);
+        }
+        // Initially, only process 0 gets the token.
+        if (pid == 0) {
+            hasToken = true;
+            lastTokenSeen = System.currentTimeMillis();
+            // Schedule token circulation at startup.
+            scheduler.schedule(() -> {
+                if (hasToken) {
+                    passToken();
+                }
+            }, 1, TimeUnit.SECONDS);
         }
         
-        // Initialize the handler map.
+        messageHandlers.put(MessageType.TOKEN, new TokenHandler());
         messageHandlers.put(MessageType.REQUEST, new RequestHandler());
-        messageHandlers.put(MessageType.GRANT, new GrantHandler());
-        messageHandlers.put(MessageType.EXISTS, new ExistsHandler());
-        messageHandlers.put(MessageType.RELEASE, new ReleaseHandler());
+        messageHandlers.put(MessageType.ELECTION, new ElectionHandler());
         messageHandlers.put(MessageType.NEW, new NewHandler());
-        messageHandlers.put(MessageType.OK, new NoOpHandler());
-        messageHandlers.put(MessageType.COORDINATOR, new CoordinatorHandler());
+        
+        // Schedule token timeout check with a randomized initial delay.
+        long initialDelay = 4000 + new Random().nextInt(2000);
+        scheduler.scheduleAtFixedRate(() -> {
+            long now = System.currentTimeMillis();
+            if (!hasToken && (now - lastTokenSeen > TOKEN_TIMEOUT) && !electionInProgress.get()) {
+                System.out.println("[PID " + pid + "] Token timeout detected. Initiating election.");
+                startElection();
+            }
+        }, initialDelay, 5000, TimeUnit.MILLISECONDS);
     }
-
+    
     public LamportClock getClock() {
         return clock;
     }
-
-    // Method to add messages to the inbox.
-    public void send(Message msg) {
-        inbox.add(msg);
-    }
-
-    // Simulated network send to the coordinator.
-    private void sendToCoordinator(Message msg) {
-        for (Process p : TokenRingSystem.processes) {
-            if (p.pid == coordinatorPid) {
-                p.send(msg);
-                break;
+    
+    // Send a message to a specific process.
+    public void send(Message msg, int targetPid) {
+        Process target = TokenRingSystem.processes.get(targetPid);
+        if (target == null || !target.isAlive()) {
+            System.out.println("[PID " + pid + "] Process " + targetPid + " not alive. Removing from ring and triggering election.");
+            removeFromRing(targetPid);
+            if (!electionInProgress.get()) {
+                startElection();
             }
+            int next = getNextInRing();
+            if (next != pid) {
+                send(msg, next);
+            }
+            return;
         }
+        target.inbox.add(msg);
     }
-
+    
     // Broadcast a message to all processes.
-    private void broadcast(Message msg) {
-        for (Process p : TokenRingSystem.processes) {
-            if (p.pid != pid) {
-                p.send(msg);
+    public void broadcast(Message msg) {
+        for (Process p : TokenRingSystem.processes.values()) {
+            if (p.pid != this.pid) {
+                p.inbox.add(msg);
             }
         }
     }
-
-    // Handle a REQUEST message.
-    void handleRequest(Message msg) {
+    
+    // Return the next process in the ring.
+    public int getNextInRing() {
+        synchronized (ringConfig) {
+            int index = ringConfig.indexOf(pid);
+            if (index == -1) return pid;
+            int nextIndex = (index + 1) % ringConfig.size();
+            return ringConfig.get(nextIndex);
+        }
+    }
+    
+    // Remove a process from the ring configuration.
+    public void removeFromRing(int targetPid) {
+        synchronized (ringConfig) {
+            ringConfig.remove((Integer) targetPid);
+        }
+    }
+    
+    // Handle TOKEN messages.
+    public void handleToken(Message msg) {
         clock.update(msg.timestamp);
-        if (isCoordinator) {
-            synchronized (requestQueue) {
-                requestQueue.add(msg);
-                if (hasToken) {
-                    grantToken();
-                }
-            }
-        }
-    }
-
-    // Grant the token to the next requester.
-    void grantToken() {
-        if (!requestQueue.isEmpty() && hasToken) {
-            Message nextReq = requestQueue.poll();
-            hasToken = false;
-            Message grant = new Message(pid, MessageType.GRANT, clock.incrementAndGet());
-            TokenRingSystem.processes.get(nextReq.senderPid).send(grant);
-            System.out.println("[COORD] Granting token to PID " + nextReq.senderPid);
-            System.out.println("[QUEUE] Next request: PID " + nextReq.senderPid + "@T" + nextReq.timestamp);
-        }
-    }
-
-    // Handle an EXISTS message.
-    void handleExists(Message msg) {
-        if (isCoordinator) {
-            Message ok = new Message(pid, MessageType.OK, clock.incrementAndGet());
-            TokenRingSystem.processes.get(msg.senderPid).send(ok);
-        }
-    }
-
-    // Handle a RELEASE message.
-    void handleRelease(Message msg) {
-        if (isCoordinator) {
-            hasToken = true;
-            grantToken();
-        }
-    }
-
-    // Become the coordinator (e.g., upon detection of failure).
-    void becomeCoordinator() {
-        System.out.println("[ELECTION] PID " + pid + " elected as coordinator");
-        isCoordinator = true;
-        coordinatorPid = pid;
         hasToken = true;
-        Message coordMsg = new Message(pid, MessageType.COORDINATOR, clock.incrementAndGet());
-        coordMsg.coordinatorPid = pid;
-        broadcast(coordMsg);
+        lastTokenSeen = System.currentTimeMillis();
+        System.out.println("[PID " + pid + "] Received token at time " + clock.get());
+        if (requestCS) {
+            enterCriticalSection();
+        } else {
+            passToken();
+        }
     }
-
-    // Check if the current coordinator is alive.
-    void checkCoordinatorAlive() {
-        scheduler.schedule(() -> {
-            if (inCriticalSection && !TokenRingSystem.processes.get(coordinatorPid).isAlive()) {
-                System.out.println("[PID " + pid + "] Detected coordinator failure!");
-                becomeCoordinator();
+    
+    public void handleRequest(Message msg) {
+        // Not used in this design; processes set their own request flag.
+    }
+    
+    // Handle ELECTION messages.
+    public void handleElection(Message msg) {
+        clock.update(msg.timestamp);
+        int candidate = msg.candidatePid;
+        if (pid > candidate) {
+            candidate = pid;
+        }
+        // If the election message has returned to its origin, finish the election.
+        if (msg.senderPid == pid) {
+            System.out.println("[ELECTION] Election complete at PID " + pid + " with candidate " + candidate);
+            electionInProgress.set(false);
+            // Broadcast updated ring configuration.
+            Message newMsg = new Message(pid, MessageType.NEW, clock.incrementAndGet());
+            synchronized (ringConfig) {
+                newMsg.ringConfig = new ArrayList<>(ringConfig);
             }
-        }, 2, TimeUnit.SECONDS);
+            broadcast(newMsg);
+            // Only the highest candidate regenerates the token.
+            if (pid == candidate) {
+                System.out.println("[ELECTION] PID " + pid + " is the highest candidate. Regenerating token.");
+                clock.reset();
+                hasToken = true;
+                lastTokenSeen = System.currentTimeMillis();
+                // Immediately circulate the token.
+                passToken();
+            }
+        } else {
+            Message newMsg = new Message(pid, MessageType.ELECTION, clock.incrementAndGet());
+            newMsg.candidatePid = candidate;
+            int next = getNextInRing();
+            send(newMsg, next);
+        }
     }
-
-    // Start the critical section.
-    void startCriticalSection() {
-        inCriticalSection = true;
-        System.out.println("[PID " + pid + "] ENTERED CRITICAL SECTION @ Time " + clock.get());
-        scheduler.scheduleAtFixedRate(() -> {
-            Message exists = new Message(pid, MessageType.EXISTS, clock.incrementAndGet());
-            sendToCoordinator(exists);
-        }, 0, 1, TimeUnit.SECONDS);
-
-        // Simulate critical section work.
+    
+    // Handle NEW messages to update the ring configuration.
+    public void updateRingConfig(Message msg) {
+        clock.update(msg.timestamp);
+        synchronized (ringConfig) {
+            ringConfig.clear();
+            ringConfig.addAll(msg.ringConfig);
+        }
+        System.out.println("[PID " + pid + "] Updated ring configuration: " + ringConfig);
+        // Designate the process with the smallest PID as the coordinator for token regeneration.
+        int coordinator = Collections.min(ringConfig);
+        if (pid == coordinator && !hasToken && System.currentTimeMillis() - lastTokenSeen > TOKEN_TIMEOUT) {
+            System.out.println("[PID " + pid + "] Regenerating token after ring update.");
+            hasToken = true;
+            lastTokenSeen = System.currentTimeMillis();
+            passToken();
+        }
+    }
+    
+    // Enter the critical section.
+    public void enterCriticalSection() {
+        System.out.println("[PID " + pid + "] ENTERED CRITICAL SECTION at time " + clock.get());
         try {
-            System.out.println("Process " + pid + " entered CS");
-            Thread.sleep(2000);
+            // Simulate critical section work.
+            Thread.sleep(10000);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-
-        inCriticalSection = false;
-        System.out.println("[PID " + pid + "] LEFT CRITICAL SECTION @ Time " + clock.get());
-        Message release = new Message(pid, MessageType.RELEASE, clock.incrementAndGet());
-        sendToCoordinator(release);
+        System.out.println("[PID " + pid + "] EXITED CRITICAL SECTION at time " + clock.incrementAndGet());
+        requestCS = false;
+        passToken();
     }
-
-    // Main run loop: delegates message handling via the handler map.
+    
+    // Pass the token to the next live process.
+    public void passToken() {
+        hasToken = false;
+        int next = getNextInRing();
+        Message tokenMsg = new Message(pid, MessageType.TOKEN, clock.incrementAndGet());
+        System.out.println("[PID " + pid + "] Passing token to PID " + next + " at time " + clock.get());
+        send(tokenMsg, next);
+    }
+    
     @Override
     public void run() {
         while (true) {
@@ -268,10 +299,9 @@ class Process implements Runnable {
                         handler.handle(this, msg);
                     }
                 }
-                if (isCoordinator) {
-                    synchronized (requestQueue) {
-                        grantToken();
-                    }
+                // If holding the token and a critical section is requested, enter CS.
+                if (hasToken && requestCS) {
+                    enterCriticalSection();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -279,8 +309,28 @@ class Process implements Runnable {
             }
         }
     }
-
-    // Simulated "alive" flag and associated methods.
+    
+    // Request entry to the critical section.
+    public void requestCriticalSection() {
+        // Synchronize on the clock to ensure unique increments.
+        synchronized (clock) {
+            clock.incrementAndGet();
+        }
+        requestCS = true;
+        System.out.println("[PID " + pid + "] Requested critical section at time " + clock.get());
+    }
+    
+    // Initiate a ring-based election.
+    public void startElection() {
+        if (!electionInProgress.compareAndSet(false, true)) return;
+        System.out.println("[PID " + pid + "] Initiating election at time " + clock.incrementAndGet());
+        Message electionMsg = new Message(pid, MessageType.ELECTION, clock.incrementAndGet());
+        electionMsg.candidatePid = pid;
+        int next = getNextInRing();
+        send(electionMsg, next);
+    }
+    
+    // Alive flag for simulation.
     private volatile boolean alive = true;
     public void setAlive(boolean alive) {
         this.alive = alive;
@@ -288,19 +338,11 @@ class Process implements Runnable {
     public boolean isAlive() {
         return alive;
     }
-
-    // Request entry to the critical section.
-    public void requestCriticalSection() {
-        Message req = new Message(pid, MessageType.REQUEST, clock.incrementAndGet());
-        sendToCoordinator(req);
-        System.out.println("[PID " + pid + "] Sent CS request to coordinator");
-    }
 }
 
-// System setup and simulation
 public class TokenRingSystem {
-    public static List<Process> processes = new ArrayList<>();
-
+    public static Map<Integer, Process> processes = new ConcurrentHashMap<>();
+    
     public static void main(String[] args) {
         int numProcesses = 5;
         List<Integer> initialRing = new ArrayList<>();
@@ -310,100 +352,52 @@ public class TokenRingSystem {
         
         // Create processes.
         for (int i = 0; i < numProcesses; i++) {
-            processes.add(new Process(i, 0, initialRing));
+            Process p = new Process(i, initialRing);
+            processes.put(i, p);
         }
         
         // Start all processes.
         ExecutorService exec = Executors.newCachedThreadPool();
-        processes.forEach(exec::submit);
+        for (Process p : processes.values()) {
+            exec.submit(p);
+        }
         
-        // Combined test sequence.
+        // Test sequence.
         new Thread(() -> {
             try {
                 System.out.println("\n=== STARTING TEST SEQUENCE ===");
                 
-                // Test 1: Mutual Exclusion.
-                System.out.println("\n[TEST 1] Mutual Exclusion");
-                testMutualExclusion();
-                Thread.sleep(15000);
-    
-                // Test 2: Coordinator Failure.
-                System.out.println("\n[TEST 2] Coordinator Failure");
-                processes.get(2).requestCriticalSection();
-                Thread.sleep(2000);
-                testCoordinatorFailure();
+                // Test 1: Mutual Exclusion via Token Passing.
+                System.out.println("\n[TEST 1] Mutual Exclusion via Token Passing");
                 Thread.sleep(10000);
-    
-                // Test 3: Fairness.
-                System.out.println("\n[TEST 3] Fairness");
-                testFairness();
-                Thread.sleep(8000);
-    
-                // Test 4: Process Recovery.
-                System.out.println("\n[TEST 4] Process Recovery");
-                testProcessRecovery();
-                
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }).start();
-    }
-
-    // Test mutual exclusion by issuing random CS requests.
-    private static void testMutualExclusion() {
-        new Thread(() -> {
-            Random rand = new Random();
-            for (int i = 0; i < 5; i++) {
-                try {
-                    Thread.sleep(3000);
-                    int requester = rand.nextInt(processes.size());
-                    System.out.println("\n[TEST 1] Process " + requester + " requests CS");
-                    processes.get(requester).requestCriticalSection();
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
-        }).start();
-    }
-
-    // Test coordinator failure by simulating a kill.
-    private static void testCoordinatorFailure() {
-        new Thread(() -> {
-            try {
-                Thread.sleep(8000);
-                System.out.println("\n[TEST 2] Killing coordinator P0");
-                processes.get(0).setAlive(false);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }).start();
-    }
-
-    // Test fairness by forcing CS requests.
-    private static void testFairness() {
-        new Thread(() -> {
-            try {
-                Thread.sleep(3000);
+                processes.get(2).requestCriticalSection();
+                processes.get(4).requestCriticalSection();
                 processes.get(1).requestCriticalSection();
+                
+                // Test 2: Process Failure and Recovery.
+                System.out.println("\n[TEST 2] Process Failure and Recovery");
+                Thread.sleep(10000);
+                System.out.println("[TEST 2] Killing PID 3");
+                processes.get(3).setAlive(false);
+                for (Process p : processes.values()) {
+                    p.removeFromRing(3);
+                }
+                Thread.sleep(10000);
+                System.out.println("[TEST 2] Reviving PID 3");
+                processes.get(3).setAlive(true);
+                // Broadcast updated ring configuration.
+                Message newMsg = new Message(0, MessageType.NEW, processes.get(0).clock.incrementAndGet());
+                synchronized (processes.get(0).ringConfig) {
+                    newMsg.ringConfig = new ArrayList<>(processes.get(0).ringConfig);
+                    if (!newMsg.ringConfig.contains(3)) {
+                        newMsg.ringConfig.add(3);
+                        Collections.sort(newMsg.ringConfig);
+                    }
+                }
+                processes.get(0).broadcast(newMsg);
+                Thread.sleep(10000);
                 processes.get(3).requestCriticalSection();
-                System.out.println("\n[TEST 3] Forced requests: PID1 and PID3");
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }).start();
-    }
-
-    // Test process recovery by reviving a killed process.
-    private static void testProcessRecovery() {
-        new Thread(() -> {
-            try {
-                Thread.sleep(15000);
-                System.out.println("\n[TEST 4] Reviving P0");
-                processes.get(0).setAlive(true);
-                processes.get(0).send(new Message(0, MessageType.NEW, 0));
-                Thread.sleep(3000);
-                System.out.println("[TEST 4] PID 0 requesting CS after recovery");
-                processes.get(0).requestCriticalSection();
+                
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
